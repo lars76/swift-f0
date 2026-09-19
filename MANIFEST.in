@@ -1,5 +1,0 @@
-include README.md
-include LICENSE
-include CHANGELOG.md
-include requirements.txt
-recursive-include swift_f0 *.onnx

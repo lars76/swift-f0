@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: If you use SwiftF0, please cite the paper below.
+title: SwiftF0
+type: software
+authors:
+  - family-names: Nieradzik
+    given-names: Lars
+version: 0.2.0
+date-released: 2026-09-19
+repository-code: https://github.com/lars76/swift-f0
+url: https://swift-f0.github.io/
+license: MIT
+preferred-citation:
+  type: article
+  title: "SwiftF0: Fast and Accurate Monophonic Pitch Detection"
+  authors:
+    - family-names: Nieradzik
+      given-names: Lars
+  year: 2025
+  journal: arXiv
+  doi: 10.48550/arXiv.2508.18440
+  url: https://arxiv.org/abs/2508.18440

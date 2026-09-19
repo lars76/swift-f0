@@ -1,15 +1,13 @@
 [build-system]
-requires = ["setuptools>=77.0.3", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build>=0.12,<0.13"]
+build-backend = "uv_build"
 
 [project]
 name = "swift-f0"
-version = "0.1.2"
+version = "0.2.0"
 description = "Fast and accurate fundamental frequency (F0) detector using convolutional neural networks"
 readme = "README.md"
 requires-python = ">=3.8"
-
-# PEP 639–style license declaration
 license = "MIT"
 license-files = ["LICENSE"]
 
@@ -23,6 +21,10 @@ keywords = [
     "audio analysis",
     "speech processing",
     "F0",
+    "pitch tracking",
+    "f0 estimation",
+    "music information retrieval",
+    "onnx",
 ]
 
 classifiers = [
@@ -31,29 +33,55 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Multimedia :: Sound/Audio :: Analysis",
     "Topic :: Multimedia :: Sound/Audio :: MIDI",
+    "Typing :: Typed",
 ]
 
 dependencies = [
-    "onnxruntime",
-    "numpy",
+    "onnxruntime>=1.18",
+    "numpy>=1.21.6",
 ]
 
 [project.optional-dependencies]
-full = ["librosa", "matplotlib", "mido"]
-audio = ["librosa"]
+full = ["soundfile", "soxr", "matplotlib", "mido"]
+audio = ["soundfile", "soxr"]
 viz = ["matplotlib"]
 midi = ["mido"]
-music = ["mido", "matplotlib"]
 
 [project.urls]
-Homepage      = "https://github.com/lars76/swift-f0"
+Homepage = "https://github.com/lars76/swift-f0"
+Source = "https://github.com/lars76/swift-f0"
+Changelog = "https://github.com/lars76/swift-f0/blob/main/CHANGELOG.md"
 "Bug Reports" = "https://github.com/lars76/swift-f0/issues"
-Source        = "https://github.com/lars76/swift-f0"
+Demo = "https://swift-f0.github.io/"
+Paper = "https://arxiv.org/abs/2508.18440"
+
+[dependency-groups]
+dev = ["soundfile", "soxr", "matplotlib", "mido", "mypy", "ruff"]
+
+[tool.uv.build-backend]
+module-root = ""
+source-include = ["CHANGELOG.md"]
+
+[tool.mypy]
+strict = true
+
+[[tool.mypy.overrides]]
+module = ["onnxruntime", "soxr", "soundfile", "mido"]
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 140
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]

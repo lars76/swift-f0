@@ -1,7 +1,11 @@
-import numpy as np
+import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
-from .core import PitchResult
+
+import numpy as np
+
+from .core import FRAME_PERIOD, SAMPLE_RATE, PathLike, PitchResult, _check_number
 
 
 @dataclass
@@ -12,194 +16,267 @@ class NoteSegment:
         start: Start time in seconds
         end: End time in seconds
         pitch_median: Median pitch frequency in Hz
-        pitch_midi: Quantized MIDI note number (0-127)
+        pitch_midi: MIDI note number (0-127): the note nearest pitch_median,
+            or with lam=None the most frequent semitone of the segment
     """
 
-    start: float  # start time in seconds
-    end: float  # end time in seconds
-    pitch_median: float  # median pitch in Hz
-    pitch_midi: int  # quantized MIDI note number
+    start: float
+    end: float
+    pitch_median: float
+    pitch_midi: int
+
+
+def _frame_period(timestamps: np.ndarray) -> float:
+    if len(timestamps) < 2:
+        return FRAME_PERIOD
+    diffs = np.diff(timestamps)
+    fp = float(np.median(diffs))
+    # Absolute and relative tolerance together accept float rounding at any frame rate.
+    if fp <= 0 or not np.all(np.abs(diffs - fp) <= 1e-9 + 1e-7 * fp):
+        raise ValueError("timestamps must be strictly increasing and uniformly spaced")
+    return fp
+
+
+def _median_runs(midi: np.ndarray, width: int) -> np.ndarray:
+    # Each voiced run is filtered on its own so the filter never smears pitch across an
+    # unvoiced gap. The window is edge-padded and odd, at most the run length rounded up to odd.
+    out = midi.copy()
+    voiced = np.flatnonzero(np.isfinite(midi))
+    if not len(voiced):
+        return out
+    for run in np.split(voiced, np.flatnonzero(np.diff(voiced) > 1) + 1):
+        if len(run) < 3:
+            continue
+        k = min(width, len(run) | 1)
+        if k <= 1:
+            continue
+        half = k // 2
+        padded = np.pad(midi[run], half, mode="edge")
+        out[run] = np.median(np.lib.stride_tricks.sliding_window_view(padded, k), axis=1)
+    return out
+
+
+def _rise_gates(audio: np.ndarray, timestamps: np.ndarray, fp: float) -> np.ndarray:
+    # RMS over a 64 ms window centered on each frame. A gate fires on the first frame whose RMS
+    # is at least 1/0.6 (4.4 dB) above the RMS 32 ms earlier: a re-articulated note. The 1e-12
+    # floor keeps digital silence from gating on rounding noise.
+    n = len(timestamps)
+    w = max(2, round(0.064 * SAMPLE_RATE))
+    if w % 2:
+        w += 1
+    half = w // 2
+    power = np.zeros(len(audio) + w)
+    np.square(audio, out=power[half : half + len(audio)])
+    sums = np.empty(len(power) + 1)
+    sums[0] = 0.0
+    np.cumsum(power, out=sums[1:])
+    starts = np.clip(np.rint(timestamps * SAMPLE_RATE).astype(int), 0, len(power) - w)
+    rms = np.sqrt(np.maximum(0.0, (sums[starts + w] - sums[starts]) / w))
+    lag = max(1, round(0.032 / fp))
+    rising = np.zeros(n, dtype=bool)
+    rising[lag:] = (rms[:-lag] <= 0.6 * rms[lag:]) & (rms[lag:] > 1e-12)
+    gates = rising.copy()
+    gates[1:] &= ~rising[:-1]
+    return gates
+
+
+def _changepoints(x: np.ndarray, penalty: Optional[float]) -> List[Tuple[int, int]]:
+    # Optimal partitioning by dynamic programming: the cost of a segmentation is the sum of
+    # squared error of each piece around its own mean plus `penalty` per piece. PELT pruning
+    # drops a start once its cost up to `end` exceeds the best cost at `end`, which is exact for
+    # this cost because splitting a piece never raises its error, and keeps the loop near linear
+    # on real contours. Subtracting x[0] keeps the prefix sums small.
+    m = len(x)
+    if m == 0:
+        return []
+    if penalty is None:
+        return [(0, m)]
+    x = x - x[0]
+    s1 = np.empty(m + 1)
+    s1[0] = 0.0
+    np.cumsum(x, out=s1[1:])
+    s2 = np.empty(m + 1)
+    s2[0] = 0.0
+    np.cumsum(x * x, out=s2[1:])
+    cost = np.full(m + 1, np.inf)
+    cost[0] = 0.0
+    back = np.zeros(m + 1, dtype=np.intp)
+    active = np.zeros(m + 1, dtype=np.intp)
+    n_active = 1
+    for end in range(1, m + 1):
+        starts = active[:n_active]
+        sse = np.maximum(0.0, s2[end] - s2[starts] - (s1[end] - s1[starts]) ** 2 / (end - starts))
+        candidates = cost[starts] + sse + penalty
+        k = int(np.argmin(candidates))
+        cost[end], back[end] = candidates[k], starts[k]
+        keep = cost[starts] + sse <= cost[end]
+        n_keep = int(np.count_nonzero(keep))
+        active[:n_keep] = starts[keep]
+        active[n_keep] = end
+        n_active = n_keep + 1
+    out, end = [], m
+    while end:
+        start = int(back[end])
+        out.append((start, end))
+        end = start
+    return out[::-1]
 
 
 def segment_notes(
     result: PitchResult,
-    split_semitone_threshold: float = 0.8,
+    *,
+    lam: Optional[float] = 250.0,
     min_note_duration: float = 0.05,
-    unvoiced_grace_period: float = 0.02,
+    detect_repeated_notes: bool = True,
 ) -> List[NoteSegment]:
     """
     Segments a pitch contour into discrete musical notes.
 
-    This function analyzes the pitch and voicing information from a PitchResult
-    object and groups consecutive frames into note segments. It splits segments
-    when pitch deviates significantly or when there are extended unvoiced periods.
+    Voicing is decided from the confidence with hysteresis (a note starts at
+    0.5 and continues while confidence stays at or above 0.3). The voiced
+    pitch is median-filtered over 64 ms, cut where the audio shows a sudden
+    rise in loudness (a re-articulated note), and each remaining stretch is
+    split into constant-pitch segments by an exact changepoint fit whose
+    penalty is `lam`. Fragments on the same pitch separated by gaps of at
+    most 80 ms are merged, and notes with less than `min_note_duration` of
+    voiced evidence are dropped.
 
     Args:
-        result: PitchResult object containing timestamps, pitch_hz, confidence, and voicing
-        split_semitone_threshold: Pitch difference in semitones to trigger a new
-            note segment. Higher values create longer notes. Recommended: 0.6-1.2
-        min_note_duration: Minimum duration in seconds for a valid note segment.
-            Shorter segments are filtered out. Recommended: 0.02-0.1
-        unvoiced_grace_period: Maximum duration in seconds of unvoiced segments
-            that are still considered part of the current note. Helps avoid
-            splitting notes due to brief gaps. Recommended: 0.01-0.05
+        result: PitchResult with timestamps, pitch_hz, confidence and the
+            audio the contour was computed from; the audio starts at the
+            first frame, as produced by detect and by the stream
+        lam: Penalty for a pitch change. Lower values split on smaller or
+            shorter pitch changes, higher values keep longer notes: 100 for
+            heavily ornamented material, 150 to 375 otherwise. None (or
+            infinity) turns pitch splitting off, so each voiced stretch
+            between loudness rises becomes one note at its most frequent
+            semitone.
+        min_note_duration: Minimum voiced duration in seconds of a note
+        detect_repeated_notes: Cut notes at sudden loudness rises so that a
+            repeated note on the same pitch is reported twice. Set to False
+            for long held tones, where a note that gets louder would be cut in two.
 
     Returns:
-        List of NoteSegment objects, each representing a distinct musical note
-        with start/end times, median pitch, and MIDI note number. Adjacent
-        segments with identical MIDI pitch are automatically merged.
+        List of NoteSegment objects ordered in time. `pitch_median` is the
+        median of the note's smoothed pitch in Hz; `pitch_midi` is the nearest
+        MIDI note (for lam=None the most frequent semitone).
 
-    Algorithm:
-        1. Convert valid pitch values to MIDI semitones
-        2. Iterate through frames, tracking voicing state
-        3. For voiced frames: start new segment or continue existing based on pitch deviation
-        4. For unvoiced frames: apply grace period before terminating segments
-        5. Filter segments by minimum duration
-        6. Merge adjacent segments with identical MIDI pitch
+    Raises:
+        TypeError: For a non-boolean detect_repeated_notes or a non-numeric lam or min_note_duration
+        ValueError: For non-uniform timestamps or invalid settings
 
     Example:
-        >>> result = swiftf0.detect_from_file("audio.wav")
-        >>> notes = segment_notes(result, split_semitone_threshold=0.8, min_note_duration=0.1)
-        >>> print(f"Found {len(notes)} note segments")
+        >>> result = swiftf0.detect_file("audio.wav")
+        >>> notes = segment_notes(result)
         >>> for note in notes[:3]:
         ...     print(f"Note: {note.pitch_midi} ({note.pitch_median:.1f} Hz) "
         ...           f"from {note.start:.2f}s to {note.end:.2f}s")
     """
-    if len(result.timestamps) == 0:
+    if not isinstance(detect_repeated_notes, (bool, np.bool_)):
+        raise TypeError("detect_repeated_notes must be a boolean")
+
+    timestamps, pitch, confidence = result.timestamps, result.pitch_hz, result.confidence
+    if not np.isfinite(timestamps).all() or np.any(timestamps < 0):
+        raise ValueError("timestamps must be finite and nonnegative")
+    finite_conf = confidence[np.isfinite(confidence)]
+    if np.any(finite_conf < 0) or np.any(finite_conf > 1):
+        raise ValueError("confidence must lie in [0, 1]")
+
+    if lam is not None:
+        lam = _check_number("lam", lam, allow_inf=True, nonnegative=True)
+        if np.isinf(lam):
+            lam = None
+    min_duration = _check_number("min_note_duration", min_note_duration, nonnegative=True)
+    n = len(timestamps)
+    if n == 0:
         return []
 
-    # Calculate frame period from timestamps
-    if len(result.timestamps) > 1:
-        frame_period = result.timestamps[1] - result.timestamps[0]
+    # All windows are given in seconds and converted to frames: a 64 ms median window, no cut
+    # within 32 ms of a run start or 16 ms of its end, gaps of up to 80 ms bridged. The penalty
+    # is `lam * FRAME_PERIOD` at the model's frame period and grows with the frames per second
+    # like the fit error does, so `lam` means the same for any frame period.
+    fp = _frame_period(timestamps)
+    median_width = 2 * round(0.032 / fp) + 1
+    start_guard = max(1, round(0.032 / fp))
+    end_guard = max(1, round(0.016 / fp))
+    max_gap = int(0.080 / fp + 1e-9)
+    min_frames = max(1, math.ceil(min_duration / fp - 1e-9))
+    penalty = None if lam is None else lam * FRAME_PERIOD**2 / fp
+
+    # Hysteresis keeps a note from flickering off when the confidence dips briefly below 0.5.
+    valid = np.isfinite(pitch) & (pitch > 0) & np.isfinite(confidence)
+    voiced = np.zeros(n, dtype=bool)
+    on = False
+    for i in range(n):
+        on = bool(valid[i] and confidence[i] >= (0.3 if on else 0.5))
+        voiced[i] = on
+    midi = np.full(n, np.nan)
+    midi[voiced] = 69.0 + 12.0 * np.log2(pitch[voiced] / 440.0)
+    midi = _median_runs(midi, median_width)
+
+    if detect_repeated_notes:
+        audio = np.asarray(result.audio, dtype=np.float64)
+        if audio.size < round((timestamps[-1] - timestamps[0]) * SAMPLE_RATE) + 1:
+            raise ValueError("the result's audio does not cover its frames; set detect_repeated_notes=False")
+        gates = _rise_gates(audio, timestamps - timestamps[0], fp)
     else:
-        frame_period = 0.016  # Default ~16ms frame period for 16kHz audio
+        gates = np.zeros(n, dtype=bool)
 
-    notes = []
-    current_note_segment = None
-    unvoiced_frames_count = 0
+    # Cut each voiced run at its loudness-rise gates, then split every piece at pitch changes.
+    intervals: List[Tuple[int, int]] = []
+    voiced_idx = np.flatnonzero(voiced)
+    for run in np.split(voiced_idx, np.flatnonzero(np.diff(voiced_idx) > 1) + 1):
+        if not len(run):
+            continue
+        start, end = int(run[0]), int(run[-1]) + 1
+        cuts = start + start_guard + np.flatnonzero(gates[start + start_guard : end - end_guard])
+        bounds = [start, *cuts.tolist(), end]
+        for left, right in zip(bounds[:-1], bounds[1:]):
+            for a, b in _changepoints(midi[left:right], penalty):
+                intervals.append((left + a, left + b))
 
-    # Pre-compute valid voiced frames mask using the voicing from PitchResult
-    valid_voiced_frames = result.voicing.copy()
+    # Join fragments on the same semitone across short gaps unless a gate marks a new attack there.
+    # Each entry carries the median of its piece so unmerged pieces are measured once.
+    merged: List[Tuple[int, int, float]] = []
+    for a, b in intervals:
+        p2 = float(np.nanmedian(midi[a:b]))
+        if merged:
+            left, end, p1 = merged[-1]
+            protected = bool(np.any(gates[max(left + 1, end - 1) : min(n, a + 2)]))
+            if a - end <= max_gap and abs(p1 - p2) < 0.5 and not protected:
+                merged[-1] = (left, b, float(np.nanmedian(midi[left:b])))
+                continue
+        merged.append((a, b, p2))
 
-    # Convert valid pitch values to MIDI semitones (vectorized operation)
-    midi_contour = np.full_like(result.pitch_hz, np.nan)
-    valid_indices = np.where(valid_voiced_frames)[0]
-    if len(valid_indices) > 0:
-        # Avoid log of zero or negative values
-        valid_pitches = result.pitch_hz[valid_indices]
-        valid_pitches = np.maximum(valid_pitches, 1e-6)  # Ensure positive values
-        midi_contour[valid_indices] = 69 + 12 * np.log2(valid_pitches / 440.0)
-
-    for i, is_voiced in enumerate(valid_voiced_frames):
-        t = result.timestamps[i]
-
-        if is_voiced and not np.isnan(midi_contour[i]):
-            unvoiced_frames_count = 0
-            midi_pitch = midi_contour[i]
-
-            if current_note_segment is None:
-                # Start new note segment
-                current_note_segment = {
-                    "start": t,
-                    "end": t + frame_period,
-                    "samples": [midi_pitch],
-                }
-            else:
-                # Check if pitch deviation exceeds threshold
-                current_median = np.median(current_note_segment["samples"])
-                pitch_deviation = abs(midi_pitch - current_median)
-
-                if pitch_deviation >= split_semitone_threshold:
-                    # Finalize current note and start new one
-                    notes.append(current_note_segment)
-                    current_note_segment = {
-                        "start": t,
-                        "end": t + frame_period,
-                        "samples": [midi_pitch],
-                    }
-                else:
-                    # Continue current note
-                    current_note_segment["samples"].append(midi_pitch)
-                    current_note_segment["end"] = t + frame_period
-
-        else:  # Unvoiced frame
-            if current_note_segment is not None:
-                unvoiced_frames_count += 1
-                unvoiced_duration = unvoiced_frames_count * frame_period
-
-                if unvoiced_duration >= unvoiced_grace_period:
-                    # Grace period exceeded - finalize current note
-                    notes.append(current_note_segment)
-                    current_note_segment = None
-                    unvoiced_frames_count = 0
-                else:
-                    # Within grace period - extend note duration
-                    current_note_segment["end"] = t + frame_period
-
-    # Finalize last note segment if it exists
-    if current_note_segment is not None:
-        notes.append(current_note_segment)
-
-    if not notes:
-        return []
-
-    # Filter by duration and compute final MIDI pitches
-    processed_notes = []
-    for segment in notes:
-        duration = segment["end"] - segment["start"]
-        if duration >= min_note_duration and segment["samples"]:
-            median_pitch_midi = np.median(segment["samples"])
-            # Convert back to Hz for the median pitch
-            median_pitch_hz = 440.0 * (2 ** ((median_pitch_midi - 69) / 12))
-
-            processed_notes.append(
-                {
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "pitch_median": median_pitch_hz,
-                    "midi_pitch": round(median_pitch_midi),
-                }
-            )
-
-    if not processed_notes:
-        return []
-
-    # Merge adjacent notes with identical MIDI pitch
-    final_notes = [processed_notes[0]]
-    epsilon = 1e-9  # For floating-point precision
-
-    for current_note in processed_notes[1:]:
-        previous_note = final_notes[-1]
-        gap = current_note["start"] - previous_note["end"]
-
-        # Merge if notes are adjacent and have same pitch
-        if (
-            gap <= frame_period + epsilon
-            and previous_note["midi_pitch"] == current_note["midi_pitch"]
-        ):
-            # Update end time and recalculate median pitch
-            previous_note["end"] = current_note["end"]
+    notes: List[NoteSegment] = []
+    for a, b, _ in merged:
+        x = midi[a:b]
+        x = x[np.isfinite(x)]
+        if len(x) < min_frames:
+            continue
+        # With the changepoint fit each piece sits on one pitch, so its median names the note.
+        # Without it (lam=None) a piece may span several pitches, so the most frequent one is used.
+        midi_median = float(np.median(x))
+        if penalty is None:
+            values, counts = np.unique(np.round(x), return_counts=True)
+            selected = float(values[np.argmax(counts)])
         else:
-            final_notes.append(current_note)
-
-    # Convert to NoteSegment objects
-    note_segments = []
-    for note in final_notes:
-        note_segments.append(
+            selected = midi_median
+        notes.append(
             NoteSegment(
-                start=note["start"],
-                end=note["end"],
-                pitch_median=note["pitch_median"],
-                pitch_midi=note["midi_pitch"],
+                start=float(timestamps[a]),
+                end=float(timestamps[b - 1] + fp),
+                pitch_median=440.0 * 2.0 ** ((midi_median - 69.0) / 12.0),
+                pitch_midi=round(selected),
             )
         )
-
-    return note_segments
+    return notes
 
 
 def export_to_midi(
     notes: List[NoteSegment],
-    output_path: str,
+    output_path: PathLike,
+    *,
     tempo: int = 120,
     velocity: int = 80,
     track_name: str = "SwiftF0 Notes",
@@ -210,7 +287,7 @@ def export_to_midi(
     Args:
         notes: List of NoteSegment objects containing note information
         output_path: Path to save the MIDI file
-        tempo: MIDI tempo in BPM (default 120)
+        tempo: MIDI tempo in BPM, 4 to 300 (default 120)
         velocity: MIDI note velocity 0-127 (default 80)
         track_name: Name for the MIDI track (default "SwiftF0 Notes")
 
@@ -218,364 +295,46 @@ def export_to_midi(
         ImportError: If mido is not installed
         ValueError: For empty notes list or invalid parameters
     """
-    # Import check
     try:
         import mido
     except ImportError:
-        raise ImportError(
-            "mido required for MIDI export. Install with: pip install mido"
-        )
+        raise ImportError('mido is required for MIDI export. Install with: pip install "swift-f0[midi]"') from None
 
-    # Validate input
     if not notes:
         raise ValueError("Cannot export empty notes list")
-    if not 1 <= tempo <= 300:
-        raise ValueError("Tempo must be between 1 and 300 BPM")
+    for name, value in (("tempo", tempo), ("velocity", velocity)):
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise TypeError(f"{name} must be an integer")
+    # The set_tempo meta message holds at most 0xFFFFFF microseconds per beat, about 3.58 BPM.
+    if not 4 <= tempo <= 300:
+        raise ValueError("Tempo must be between 4 and 300 BPM")
     if not 0 <= velocity <= 127:
         raise ValueError("Velocity must be between 0 and 127")
 
-    # Create MIDI file with one track
-    mid = mido.MidiFile()
+    ticks_per_beat = 480
+    mid = mido.MidiFile(ticks_per_beat=ticks_per_beat)
     track = mido.MidiTrack()
     mid.tracks.append(track)
-
-    # Add track name
     track.append(mido.MetaMessage("track_name", name=track_name, time=0))
+    track.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(tempo), time=0))
 
-    # Set tempo (microseconds per beat)
-    tempo_msg = mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(tempo), time=0)
-    track.append(tempo_msg)
-
-    # Convert notes to MIDI events
-    # Sort notes by start time to ensure proper ordering
-    sorted_notes = sorted(notes, key=lambda n: n.start)
-
-    # Track current time in MIDI ticks (480 ticks per beat is standard)
-    ticks_per_beat = 480
-    current_time_ticks = 0
-
-    # Convert seconds to MIDI ticks: ticks = seconds * (ticks_per_beat * tempo / 60)
     def seconds_to_ticks(seconds: float) -> int:
-        return int(seconds * (ticks_per_beat * tempo / 60))
+        return round(seconds * (ticks_per_beat * tempo / 60))
 
-    for note in sorted_notes:
-        # Calculate timing
-        note_start_ticks = seconds_to_ticks(note.start)
-        note_duration_ticks = seconds_to_ticks(note.end - note.start)
-
-        # Time delta from current position to note start
-        time_to_start = max(0, note_start_ticks - current_time_ticks)
-
-        # Ensure MIDI note is in valid range (0-127)
-        midi_note = max(0, min(127, note.pitch_midi))
-
-        # Add note_on message
-        track.append(
-            mido.Message(
-                "note_on",
-                channel=0,
-                note=midi_note,
-                velocity=velocity,
-                time=time_to_start,
-            )
-        )
-
-        # Add note_off message
-        track.append(
-            mido.Message(
-                "note_off",
-                channel=0,
-                note=midi_note,
-                velocity=velocity,
-                time=note_duration_ticks,
-            )
-        )
-
-        # Update current time
-        current_time_ticks = note_start_ticks + note_duration_ticks
-
-    # Save MIDI file
-    mid.save(output_path)
-
-
-def plot_notes(
-    notes: List[NoteSegment],
-    output_path: Optional[str] = None,
-    show: bool = True,
-    dpi: int = 300,
-    figsize: Tuple[float, float] = (12, 6),
-    style: str = "seaborn-v0_8",
-) -> None:
-    """
-    Plot note segments as a piano roll visualization, optionally saving and/or showing.
-
-    Args:
-        notes: List of NoteSegment objects containing note information
-        output_path: Path to save the plot (optional)
-        show: Whether to display the plot interactively (default True)
-        dpi: Image resolution for saving (default 300)
-        figsize: Figure size in inches (width, height) (default (12, 6))
-        style: Matplotlib style to use (default "seaborn-v0_8")
-
-    Raises:
-        ImportError: If matplotlib is not installed
-        ValueError: For empty notes list
-    """
-    # Import check
-    try:
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as patches
-    except ImportError:
-        raise ImportError(
-            "matplotlib required for plotting. Install with: pip install matplotlib"
-        )
-
-    # Validate input
-    if not notes:
-        raise ValueError("Cannot plot empty notes list")
-
-    # Style selection with fallback
-    available_styles = plt.style.available
-    if style in available_styles:
-        plt.style.use(style)
-    else:
-        plt.style.use("default")
-
-    # Calculate plot dimensions
-    start_times = [note.start for note in notes]
-    end_times = [note.end for note in notes]
-    midi_notes = [note.pitch_midi for note in notes]
-
-    time_min = min(start_times)
-    time_max = max(end_times)
-    midi_min = min(midi_notes) - 2  # Add padding
-    midi_max = max(midi_notes) + 2
-
-    # Create figure and axis
-    fig, ax = plt.subplots(figsize=figsize)
-
-    # Color mapping for visual variety
-    import matplotlib.cm as cm
-    import matplotlib.colors as colors
-
-    # Use a colormap based on pitch height
-    norm = colors.Normalize(vmin=midi_min, vmax=midi_max)
-    colormap = cm.viridis
-
-    # Plot each note as a rectangle
+    # Absolute events; a note_off sorts before a note_on at the same tick so repeated and
+    # overlapping notes keep their lengths, and every note lasts at least one tick.
+    events = []
     for note in notes:
-        duration = note.end - note.start
+        midi_note = max(0, min(127, note.pitch_midi))
+        start_tick = seconds_to_ticks(note.start)
+        end_tick = max(start_tick + 1, seconds_to_ticks(note.end))
+        events.append((start_tick, 1, "note_on", midi_note, velocity))
+        events.append((end_tick, 0, "note_off", midi_note, 0))
+    events.sort()
 
-        # Create rectangle for note
-        rect = patches.Rectangle(
-            (
-                note.start,
-                note.pitch_midi - 0.4,
-            ),  # (x, y) - center vertically on MIDI note
-            duration,  # width (duration)
-            0.8,  # height (slightly less than 1 semitone)
-            linewidth=1,
-            edgecolor="black",
-            facecolor=colormap(norm(note.pitch_midi)),
-            alpha=0.8,
-        )
-        ax.add_patch(rect)
+    previous_tick = 0
+    for tick, _, kind, midi_note, event_velocity in events:
+        track.append(mido.Message(kind, channel=0, note=midi_note, velocity=event_velocity, time=tick - previous_tick))
+        previous_tick = tick
 
-        # Add MIDI note number as text if rectangle is wide enough
-        if duration > (time_max - time_min) * 0.02:  # Only if >2% of total time
-            ax.text(
-                note.start + duration / 2,
-                note.pitch_midi,
-                str(note.pitch_midi),
-                ha="center",
-                va="center",
-                fontsize=8,
-                fontweight="bold",
-                color="white"
-                if note.pitch_midi < (midi_min + midi_max) / 2
-                else "black",
-            )
-
-    # Configure plot appearance
-    ax.set_xlim(time_min - 0.1, time_max + 0.1)
-    ax.set_ylim(midi_min, midi_max)
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("MIDI Note Number")
-    ax.set_title("Note Segments (Piano Roll View)")
-    ax.grid(True, alpha=0.3)
-
-    # Add note names on y-axis for reference
-    note_names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-
-    # Show note names for a reasonable range
-    if midi_max - midi_min <= 24:  # Only if showing 2 octaves or less
-        y_ticks = list(range(int(midi_min), int(midi_max) + 1))
-        y_labels = [f"{note_names[midi % 12]}{midi // 12 - 1}" for midi in y_ticks]
-        ax.set_yticks(y_ticks)
-        ax.set_yticklabels(y_labels)
-
-    fig.tight_layout()
-
-    # Save to file if requested
-    if output_path:
-        fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
-
-    # Show interactively if requested
-    if show:
-        plt.show()
-
-    # Close figure to free memory
-    plt.close(fig)
-
-
-def plot_pitch_and_notes(
-    result: PitchResult,
-    segments: List[NoteSegment],
-    output_path: Optional[str] = None,
-    show: bool = True,
-    dpi: int = 300,
-    figsize: Tuple[float, float] = (12, 4),
-    style: str = "seaborn-v0_8",
-) -> None:
-    """
-    Plot pitch contour with overlaid note segments, optionally saving and/or showing.
-
-    Displays the continuous pitch contour from PitchResult with shaded regions
-    showing the segmented notes. Each segment is labeled with its MIDI note number.
-    Unvoiced regions appear as gaps in the pitch line.
-
-    Args:
-        result: PitchResult object containing pitch detection results
-        segments: List of NoteSegment objects from segment_notes()
-        output_path: Path to save the plot (optional)
-        show: Whether to display the plot interactively (default True)
-        dpi: Image resolution for saving (default 300)
-        figsize: Figure size in inches (width, height) (default (12, 4))
-        style: Matplotlib style to use (default "seaborn-v0_8")
-
-    Raises:
-        ImportError: If matplotlib is not installed
-        ValueError: For empty results or mismatched array lengths
-
-    Example:
-        >>> result = detector.detect_from_file("audio.wav")
-        >>> segments = segment_notes(result)
-        >>> plot_pitch_with_segments(result, segments, "analysis.png")
-    """
-    # Import check
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        raise ImportError(
-            "matplotlib required for plotting. Install with: pip install matplotlib"
-        )
-
-    # Validate input
-    n_frames = len(result.timestamps)
-    if n_frames == 0:
-        raise ValueError("Cannot plot empty results")
-    if not (
-        len(result.pitch_hz)
-        == len(result.confidence)
-        == len(result.voicing)
-        == n_frames
-    ):
-        raise ValueError("All result arrays must have the same length")
-
-    # Style selection with fallback
-    available_styles = plt.style.available
-    if style in available_styles:
-        plt.style.use(style)
-    else:
-        plt.style.use("default")
-
-    # Prepare voiced data (set unvoiced regions to NaN for plotting)
-    pitch_voiced = np.where(result.voicing, result.pitch_hz, np.nan)
-
-    # Calculate frequency limits with padding
-    voiced_frequencies = result.pitch_hz[result.voicing]
-    if len(voiced_frequencies) > 0:
-        fmin = max(1, voiced_frequencies.min() * 0.9)  # 10% padding below
-        fmax = min(5000, voiced_frequencies.max() * 1.1)  # 10% padding above
-    else:
-        fmin, fmax = 50, 500  # Default range when no voiced frames
-
-    # Create figure and axis
-    fig, ax = plt.subplots(figsize=figsize)
-
-    # Plot unvoiced segments (background) - matches plot_pitch style
-    ax.plot(
-        result.timestamps,
-        result.pitch_hz,
-        color="lightgray",
-        alpha=0.7,
-        linewidth=1.0,
-        label="Unvoiced",
-        zorder=1,
-    )
-
-    # Plot voiced segments (foreground) - matches plot_pitch style
-    ax.plot(
-        result.timestamps,
-        pitch_voiced,
-        color="blue",
-        linewidth=1.8,
-        label="Voiced",
-        zorder=2,
-    )
-
-    # Add segment overlays
-    if segments:
-        # Shade segments
-        for segment in segments:
-            ax.axvspan(
-                segment.start,
-                segment.end,
-                color="orange",
-                alpha=0.3,
-                zorder=0,
-                label="Note Segments" if segment == segments[0] else "",
-            )
-
-        # Add MIDI labels for segments
-        y_offset = (fmax - fmin) * 0.05  # 5% of frequency range
-        for segment in segments:
-            mid_time = (segment.start + segment.end) / 2
-
-            # Only add label if segment is wide enough and within time bounds
-            segment_duration = segment.end - segment.start
-            total_duration = result.timestamps[-1] - result.timestamps[0]
-
-            if segment_duration > total_duration * 0.01:  # Only if >1% of total time
-                ax.text(
-                    mid_time,
-                    segment.pitch_median + y_offset,
-                    f"MIDI {segment.pitch_midi}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=9,
-                    fontweight="bold",
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
-                    zorder=3,
-                )
-
-    # Configure plot appearance - matches plot_pitch style
-    ax.set_ylim(fmin, fmax)
-    ax.set_xlim(result.timestamps[0], result.timestamps[-1])
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Pitch (Hz)")
-    ax.set_title("SwiftF0 Pitch Detection with Note Segments")
-    ax.legend(loc="upper right")
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-
-    # Save to file if requested
-    if output_path:
-        fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
-
-    # Show interactively if requested
-    if show:
-        plt.show()
-
-    # Close figure to free memory
-    plt.close(fig)
+    mid.save(os.fspath(output_path))
