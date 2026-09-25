@@ -8,7 +8,7 @@ It provides a simple API for detecting pitch from audio files, numpy arrays or a
 from importlib.metadata import version as _version
 
 from .core import FMAX, FMIN, FRAME_PERIOD, SAMPLE_RATE, PitchResult, PitchStream, SwiftF0, concat, export_to_csv
-from .music import NoteSegment, export_to_midi, segment_notes
+from .music import Note, export_to_midi, segment_notes
 from .plot import plot_notes, plot_pitch, plot_pitch_and_notes
 
 __all__ = [
@@ -24,7 +24,7 @@ __all__ = [
     "concat",
     "export_to_csv",
     # Musical analysis
-    "NoteSegment",
+    "Note",
     "segment_notes",
     "export_to_midi",
     # Plots

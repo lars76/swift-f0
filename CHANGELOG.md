@@ -1,11 +1,47 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
-
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.3.0] - 2026-09-25
+
+Higher pitch F1 with a pitch range, better notes, and far less memory on long audio.
+The note API changes. Changed and Removed list every difference.
+
+### Added
+- The training code and the shipped model run are public in
+  [swift-f0-training](https://github.com/lars76/swift-f0-training).
+
+### Changed
+- Pitch F1 on the [pitch benchmark](https://github.com/lars76/pitch-benchmark) rises
+  from 0.778 to 0.781. With `fmin` and `fmax` set, a frame whose best pitch lies
+  outside the band now gets confidence 0. Before, it jumped to another pitch inside
+  the band. The weights are unchanged, so at the full range the results are identical
+  up to float rounding in the pitch.
+- Better notes. `segment_notes` now finds the best notes for the whole recording at
+  once. The notes are about 4 to 7 % more accurate. Note lists change for existing
+  users.
+- `segment_notes` takes `pitch_hold_ms` (default 80) instead of `lam`. Higher values
+  give fewer, longer notes. The [article](https://swift-f0.github.io/how/#how-notes)
+  explains how it works.
+- Notes are `Note(start, end, pitch_hz)`, where `pitch_hz` is the pitch fitted to the note.
+- `PitchResult.audio` is replaced by `loudness_db`, the level of each frame in dB.
+- `plot_pitch_and_notes` names its second argument `notes` instead of `segments`.
+- The pitch plots use a log-frequency axis fitted to the voiced frames. Figures look different.
+- Invalid input raises an error instead of being skipped silently. This covers
+  complex or non-numeric audio, NaN confidence and notes without a pitch.
+- The package requires onnxruntime 1.19 or newer and, for the plots, matplotlib 3.3 or newer.
+
+### Removed
+- `lam`, `min_note_duration`, `detect_repeated_notes` and `NoteSegment`.
+- `segment_notes` only accepts results with 16 ms frames.
+
+### Fixed
+- `detect` uses far less memory on long audio: 10 minutes peak at about 350 MB
+  instead of 2.6 GB. The results are unchanged up to float rounding in the pitch.
+- `export_to_midi` and the plots accept an iterator of notes, not only a list.
 
 ## [0.2.0] - 2026-09-19
 
@@ -81,7 +117,8 @@ This release changes the API. The Changed and Removed sections list every differ
 - Support for frequencies between 46.875 Hz and 2093.75 Hz (G1 to C7)
 - Real-time analysis optimization (132 ms for 5 seconds of audio on CPU)
 
-[Unreleased]: https://github.com/lars76/swift-f0/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/lars76/swift-f0/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/lars76/swift-f0/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/lars76/swift-f0/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/lars76/swift-f0/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/lars76/swift-f0/compare/v0.1.0...v0.1.1

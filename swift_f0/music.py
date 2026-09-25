@@ -1,280 +1,141 @@
 import math
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List
 
 import numpy as np
 
-from .core import FRAME_PERIOD, SAMPLE_RATE, PathLike, PitchResult, _check_number
+from .core import FRAME_PERIOD, PathLike, PitchResult, _check_number
 
 
 @dataclass
-class NoteSegment:
-    """Represents a musical note segment with timing and pitch information.
+class Note:
+    """A note found by `segment_notes`.
 
     Attributes:
         start: Start time in seconds
         end: End time in seconds
-        pitch_median: Median pitch frequency in Hz
-        pitch_midi: MIDI note number (0-127): the note nearest pitch_median,
-            or with lam=None the most frequent semitone of the segment
+        pitch_hz: The note's fitted pitch in Hz: the observed frame pitch, rounded to a
+            cent, that minimizes the note's confidence-weighted pitch error, capped at
+            2 semitones per frame
     """
 
     start: float
     end: float
-    pitch_median: float
-    pitch_midi: int
+    pitch_hz: float
 
 
-def _frame_period(timestamps: np.ndarray) -> float:
-    if len(timestamps) < 2:
-        return FRAME_PERIOD
-    diffs = np.diff(timestamps)
-    fp = float(np.median(diffs))
-    # Absolute and relative tolerance together accept float rounding at any frame rate.
-    if fp <= 0 or not np.all(np.abs(diffs - fp) <= 1e-9 + 1e-7 * fp):
-        raise ValueError("timestamps must be strictly increasing and uniformly spaced")
-    return fp
+def _nearest_midi(pitch_hz: float) -> int:
+    return math.floor(69 + 12 * math.log2(pitch_hz / 440) + 0.5)
 
 
-def _median_runs(midi: np.ndarray, width: int) -> np.ndarray:
-    # Each voiced run is filtered on its own so the filter never smears pitch across an
-    # unvoiced gap. The window is edge-padded and odd, at most the run length rounded up to odd.
-    out = midi.copy()
-    voiced = np.flatnonzero(np.isfinite(midi))
-    if not len(voiced):
-        return out
-    for run in np.split(voiced, np.flatnonzero(np.diff(voiced) > 1) + 1):
-        if len(run) < 3:
-            continue
-        k = min(width, len(run) | 1)
-        if k <= 1:
-            continue
-        half = k // 2
-        padded = np.pad(midi[run], half, mode="edge")
-        out[run] = np.median(np.lib.stride_tricks.sliding_window_view(padded, k), axis=1)
-    return out
-
-
-def _rise_gates(audio: np.ndarray, timestamps: np.ndarray, fp: float) -> np.ndarray:
-    # RMS over a 64 ms window centered on each frame. A gate fires on the first frame whose RMS
-    # is at least 1/0.6 (4.4 dB) above the RMS 32 ms earlier: a re-articulated note. The 1e-12
-    # floor keeps digital silence from gating on rounding noise.
-    n = len(timestamps)
-    w = max(2, round(0.064 * SAMPLE_RATE))
-    if w % 2:
-        w += 1
-    half = w // 2
-    power = np.zeros(len(audio) + w)
-    np.square(audio, out=power[half : half + len(audio)])
-    sums = np.empty(len(power) + 1)
-    sums[0] = 0.0
-    np.cumsum(power, out=sums[1:])
-    starts = np.clip(np.rint(timestamps * SAMPLE_RATE).astype(int), 0, len(power) - w)
-    rms = np.sqrt(np.maximum(0.0, (sums[starts + w] - sums[starts]) / w))
-    lag = max(1, round(0.032 / fp))
-    rising = np.zeros(n, dtype=bool)
-    rising[lag:] = (rms[:-lag] <= 0.6 * rms[lag:]) & (rms[lag:] > 1e-12)
-    gates = rising.copy()
-    gates[1:] &= ~rising[:-1]
-    return gates
-
-
-def _changepoints(x: np.ndarray, penalty: Optional[float]) -> List[Tuple[int, int]]:
-    # Optimal partitioning by dynamic programming: the cost of a segmentation is the sum of
-    # squared error of each piece around its own mean plus `penalty` per piece. PELT pruning
-    # drops a start once its cost up to `end` exceeds the best cost at `end`, which is exact for
-    # this cost because splitting a piece never raises its error, and keeps the loop near linear
-    # on real contours. Subtracting x[0] keeps the prefix sums small.
-    m = len(x)
-    if m == 0:
-        return []
-    if penalty is None:
-        return [(0, m)]
-    x = x - x[0]
-    s1 = np.empty(m + 1)
-    s1[0] = 0.0
-    np.cumsum(x, out=s1[1:])
-    s2 = np.empty(m + 1)
-    s2[0] = 0.0
-    np.cumsum(x * x, out=s2[1:])
-    cost = np.full(m + 1, np.inf)
-    cost[0] = 0.0
-    back = np.zeros(m + 1, dtype=np.intp)
-    active = np.zeros(m + 1, dtype=np.intp)
-    n_active = 1
-    for end in range(1, m + 1):
-        starts = active[:n_active]
-        sse = np.maximum(0.0, s2[end] - s2[starts] - (s1[end] - s1[starts]) ** 2 / (end - starts))
-        candidates = cost[starts] + sse + penalty
-        k = int(np.argmin(candidates))
-        cost[end], back[end] = candidates[k], starts[k]
-        keep = cost[starts] + sse <= cost[end]
-        n_keep = int(np.count_nonzero(keep))
-        active[:n_keep] = starts[keep]
-        active[n_keep] = end
-        n_active = n_keep + 1
-    out, end = [], m
-    while end:
-        start = int(back[end])
-        out.append((start, end))
-        end = start
-    return out[::-1]
-
-
-def segment_notes(
-    result: PitchResult,
-    *,
-    lam: Optional[float] = 250.0,
-    min_note_duration: float = 0.05,
-    detect_repeated_notes: bool = True,
-) -> List[NoteSegment]:
+def segment_notes(result: PitchResult, *, pitch_hold_ms: float = 80.0) -> List[Note]:
     """
-    Segments a pitch contour into discrete musical notes.
+    Segments a pitch contour into notes.
 
-    Voicing is decided from the confidence with hysteresis (a note starts at
-    0.5 and continues while confidence stays at or above 0.3). The voiced
-    pitch is median-filtered over 64 ms, cut where the audio shows a sudden
-    rise in loudness (a re-articulated note), and each remaining stretch is
-    split into constant-pitch segments by an exact changepoint fit whose
-    penalty is `lam`. Fragments on the same pitch separated by gaps of at
-    most 80 ms are merged, and notes with less than `min_note_duration` of
-    voiced evidence are dropped.
+    Splits the frames into notes and gaps with the smallest total cost
+
+        J = sum over notes of [beta + sum over its frames of (offpitch + unvoiced + quiet)]
+
+    found exactly by dynamic programming. Each note has one pitch mu. Gaps cost nothing.
+
+    - offpitch = c * min(|m - mu|, 2), where m is the frame's pitch in semitones and c
+      its confidence, 0 for a frame without a pitch
+    - unvoiced = -ln(c / (1 - c)), with c clipped to [0.01, 0.99]
+    - quiet = the dB by which the frame lies more than 3 dB below the loudest frames
+      within 64 ms on both sides, otherwise 0
+
+    beta = pitch_hold_ms / 16 ms is the cost of each note. mu is one of the measured
+    pitches, rounded to a cent. At the default of 80 ms, a new pitch one semitone away
+    becomes a note of its own once it lasts longer than 80 ms. A jump of two semitones
+    or more needs half that time. A pitch that returns to the old note needs twice as
+    long. The article at https://swift-f0.github.io/how/#how-notes explains the method.
+
+    Five minutes of audio take about 0.2 s, one hour about 3.5 s.
 
     Args:
-        result: PitchResult with timestamps, pitch_hz, confidence and the
-            audio the contour was computed from; the audio starts at the
-            first frame, as produced by detect and by the stream
-        lam: Penalty for a pitch change. Lower values split on smaller or
-            shorter pitch changes, higher values keep longer notes: 100 for
-            heavily ornamented material, 150 to 375 otherwise. None (or
-            infinity) turns pitch splitting off, so each voiced stretch
-            between loudness rises becomes one note at its most frequent
-            semitone.
-        min_note_duration: Minimum voiced duration in seconds of a note
-        detect_repeated_notes: Cut notes at sudden loudness rises so that a
-            repeated note on the same pitch is reported twice. Set to False
-            for long held tones, where a note that gets louder would be cut in two.
+        result: PitchResult of one take, timestamps spaced FRAME_PERIOD apart
+        pitch_hold_ms: Penalty per note. Higher gives fewer, longer notes. At 0 a
+            note starts at every pitch change, and frames at or below confidence 0.5
+            are dropped.
 
     Returns:
-        List of NoteSegment objects ordered in time. `pitch_median` is the
-        median of the note's smoothed pitch in Hz; `pitch_midi` is the nearest
-        MIDI note (for lam=None the most frequent semitone).
+        List of Note objects ordered in time.
 
     Raises:
-        TypeError: For a non-boolean detect_repeated_notes or a non-numeric lam or min_note_duration
-        ValueError: For non-uniform timestamps or invalid settings
+        TypeError: For a non-numeric pitch_hold_ms
+        ValueError: For a negative or infinite pitch_hold_ms, timestamps not spaced
+            FRAME_PERIOD apart, confidence outside [0, 1] or non-finite loudness
 
     Example:
-        >>> result = swiftf0.detect_file("audio.wav")
-        >>> notes = segment_notes(result)
-        >>> for note in notes[:3]:
-        ...     print(f"Note: {note.pitch_midi} ({note.pitch_median:.1f} Hz) "
-        ...           f"from {note.start:.2f}s to {note.end:.2f}s")
+        >>> notes = segment_notes(detector.detect_file("audio.wav"))
+        >>> print(notes[0].start, notes[0].end, notes[0].pitch_hz)
     """
-    if not isinstance(detect_repeated_notes, (bool, np.bool_)):
-        raise TypeError("detect_repeated_notes must be a boolean")
-
-    timestamps, pitch, confidence = result.timestamps, result.pitch_hz, result.confidence
+    hold_ms = _check_number("pitch_hold_ms", pitch_hold_ms, nonnegative=True)
+    timestamps, pitch, confidence, level = result.timestamps, result.pitch_hz, result.confidence, result.loudness_db
     if not np.isfinite(timestamps).all() or np.any(timestamps < 0):
         raise ValueError("timestamps must be finite and nonnegative")
-    finite_conf = confidence[np.isfinite(confidence)]
-    if np.any(finite_conf < 0) or np.any(finite_conf > 1):
+    if len(timestamps) > 1 and not np.all(np.abs(np.diff(timestamps) - FRAME_PERIOD) <= 1e-9):
+        raise ValueError("timestamps must be spaced FRAME_PERIOD apart")
+    if not np.isfinite(confidence).all() or np.any(confidence < 0) or np.any(confidence > 1):
         raise ValueError("confidence must lie in [0, 1]")
+    if not np.isfinite(level).all():
+        raise ValueError("loudness_db must be finite")
 
-    if lam is not None:
-        lam = _check_number("lam", lam, allow_inf=True, nonnegative=True)
-        if np.isinf(lam):
-            lam = None
-    min_duration = _check_number("min_note_duration", min_note_duration, nonnegative=True)
     n = len(timestamps)
-    if n == 0:
+    valid = np.isfinite(pitch) & (pitch > 0)
+    if not valid.any():
         return []
+    m = np.zeros(n)
+    m[valid] = 69.0 + 12.0 * np.log2(pitch[valid] / 440.0)
+    w = np.where(valid, confidence, 0.0)
+    cc = np.clip(w, 0.01, 0.99)
+    padded = np.pad(level, 4, mode="symmetric")
+    left = np.maximum.reduce([padded[j : j + n] for j in range(5)])
+    right = np.maximum.reduce([padded[4 + j : 4 + j + n] for j in range(5)])
+    q = -np.log(cc / (1.0 - cc)) + np.maximum(0.0, np.minimum(left, right) - level - 10 * np.log10(2.0))
+    mu = np.unique(np.floor(m[valid] * 100 + 0.5) / 100)
+    beta = hold_ms / 1000 / FRAME_PERIOD
 
-    # All windows are given in seconds and converted to frames: a 64 ms median window, no cut
-    # within 32 ms of a run start or 16 ms of its end, gaps of up to 80 ms bridged. The penalty
-    # is `lam * FRAME_PERIOD` at the model's frame period and grows with the frames per second
-    # like the fit error does, so `lam` means the same for any frame period.
-    fp = _frame_period(timestamps)
-    median_width = 2 * round(0.032 / fp) + 1
-    start_guard = max(1, round(0.032 / fp))
-    end_guard = max(1, round(0.016 / fp))
-    max_gap = int(0.080 / fp + 1e-9)
-    min_frames = max(1, math.ceil(min_duration / fp - 1e-9))
-    penalty = None if lam is None else lam * FRAME_PERIOD**2 / fp
-
-    # Hysteresis keeps a note from flickering off when the confidence dips briefly below 0.5.
-    valid = np.isfinite(pitch) & (pitch > 0) & np.isfinite(confidence)
-    voiced = np.zeros(n, dtype=bool)
-    on = False
-    for i in range(n):
-        on = bool(valid[i] and confidence[i] >= (0.3 if on else 0.5))
-        voiced[i] = on
-    midi = np.full(n, np.nan)
-    midi[voiced] = 69.0 + 12.0 * np.log2(pitch[voiced] / 440.0)
-    midi = _median_runs(midi, median_width)
-
-    if detect_repeated_notes:
-        audio = np.asarray(result.audio, dtype=np.float64)
-        if audio.size < round((timestamps[-1] - timestamps[0]) * SAMPLE_RATE) + 1:
-            raise ValueError("the result's audio does not cover its frames; set detect_repeated_notes=False")
-        gates = _rise_gates(audio, timestamps - timestamps[0], fp)
-    else:
-        gates = np.zeros(n, dtype=bool)
-
-    # Cut each voiced run at its loudness-rise gates, then split every piece at pitch changes.
-    intervals: List[Tuple[int, int]] = []
-    voiced_idx = np.flatnonzero(voiced)
-    for run in np.split(voiced_idx, np.flatnonzero(np.diff(voiced_idx) > 1) + 1):
-        if not len(run):
-            continue
-        start, end = int(run[0]), int(run[-1]) + 1
-        cuts = start + start_guard + np.flatnonzero(gates[start + start_guard : end - end_guard])
-        bounds = [start, *cuts.tolist(), end]
-        for left, right in zip(bounds[:-1], bounds[1:]):
-            for a, b in _changepoints(midi[left:right], penalty):
-                intervals.append((left + a, left + b))
-
-    # Join fragments on the same semitone across short gaps unless a gate marks a new attack there.
-    # Each entry carries the median of its piece so unmerged pieces are measured once.
-    merged: List[Tuple[int, int, float]] = []
-    for a, b in intervals:
-        p2 = float(np.nanmedian(midi[a:b]))
-        if merged:
-            left, end, p1 = merged[-1]
-            protected = bool(np.any(gates[max(left + 1, end - 1) : min(n, a + 2)]))
-            if a - end <= max_gap and abs(p1 - p2) < 0.5 and not protected:
-                merged[-1] = (left, b, float(np.nanmedian(midi[left:b])))
-                continue
-        merged.append((a, b, p2))
-
-    notes: List[NoteSegment] = []
-    for a, b, _ in merged:
-        x = midi[a:b]
-        x = x[np.isfinite(x)]
-        if len(x) < min_frames:
-            continue
-        # With the changepoint fit each piece sits on one pitch, so its median names the note.
-        # Without it (lam=None) a piece may span several pitches, so the most frequent one is used.
-        midi_median = float(np.median(x))
-        if penalty is None:
-            values, counts = np.unique(np.round(x), return_counts=True)
-            selected = float(values[np.argmax(counts)])
+    vn = np.full(len(mu), np.inf)
+    note_start = np.zeros(len(mu), dtype=np.intp)
+    back = np.zeros(n + 1, dtype=np.intp)
+    kind = np.full(n + 1, -1, dtype=np.intp)
+    work = np.empty(len(mu))
+    best = 0.0
+    for t in range(n):
+        start = best + beta
+        new = start < vn
+        note_start[new] = t
+        np.minimum(vn, start, out=vn)
+        np.subtract(mu, m[t], out=work)
+        np.abs(work, out=work)
+        np.minimum(work, 2.0, out=work)
+        work *= w[t]
+        work += q[t]
+        vn += work
+        j = int(np.argmin(vn))
+        if vn[j] < best:
+            best = float(vn[j])
+            back[t + 1] = note_start[j]
+            kind[t + 1] = j
         else:
-            selected = midi_median
-        notes.append(
-            NoteSegment(
-                start=float(timestamps[a]),
-                end=float(timestamps[b - 1] + fp),
-                pitch_median=440.0 * 2.0 ** ((midi_median - 69.0) / 12.0),
-                pitch_midi=round(selected),
-            )
-        )
+            back[t + 1] = t
+
+    notes: List[Note] = []
+    b = n
+    while b > 0:
+        a = int(back[b])
+        if kind[b] >= 0:
+            pitch_hz = float(440.0 * 2.0 ** ((mu[kind[b]] - 69.0) / 12.0))
+            notes.append(Note(start=float(timestamps[a]), end=float(timestamps[b - 1] + FRAME_PERIOD), pitch_hz=pitch_hz))
+        b = a
+    notes.reverse()
     return notes
 
 
 def export_to_midi(
-    notes: List[NoteSegment],
+    notes: List[Note],
     output_path: PathLike,
     *,
     tempo: int = 120,
@@ -282,10 +143,11 @@ def export_to_midi(
     track_name: str = "SwiftF0 Notes",
 ) -> None:
     """
-    Export note segments to MIDI file.
+    Export notes to a MIDI file. Each note is written as the MIDI number nearest
+    its pitch, halves rounded up.
 
     Args:
-        notes: List of NoteSegment objects containing note information
+        notes: List of Note objects
         output_path: Path to save the MIDI file
         tempo: MIDI tempo in BPM, 4 to 300 (default 120)
         velocity: MIDI note velocity 0-127 (default 80)
@@ -293,15 +155,19 @@ def export_to_midi(
 
     Raises:
         ImportError: If mido is not installed
-        ValueError: For empty notes list or invalid parameters
+        ValueError: For an empty notes list, a note without a finite pitch_hz above 0
+            or invalid parameters
     """
     try:
         import mido
     except ImportError:
         raise ImportError('mido is required for MIDI export. Install with: pip install "swift-f0[midi]"') from None
 
+    notes = list(notes)
     if not notes:
         raise ValueError("Cannot export empty notes list")
+    if not all(math.isfinite(note.pitch_hz) and note.pitch_hz > 0 for note in notes):
+        raise ValueError("Every note needs a finite pitch_hz above 0")
     for name, value in (("tempo", tempo), ("velocity", velocity)):
         if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
             raise TypeError(f"{name} must be an integer")
@@ -325,7 +191,7 @@ def export_to_midi(
     # overlapping notes keep their lengths, and every note lasts at least one tick.
     events = []
     for note in notes:
-        midi_note = max(0, min(127, note.pitch_midi))
+        midi_note = max(0, min(127, _nearest_midi(note.pitch_hz)))
         start_tick = seconds_to_ticks(note.start)
         end_tick = max(start_tick + 1, seconds_to_ticks(note.end))
         events.append((start_tick, 1, "note_on", midi_note, velocity))

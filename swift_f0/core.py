@@ -13,13 +13,14 @@ HOP = 256
 FRAME_PERIOD = HOP / SAMPLE_RATE
 FMIN = 46.875
 FMAX = 2093.75
-# The model scores 95 log-spaced pitch bins; a band narrower than one bin holds no candidate.
+# The model scores 95 log-spaced pitch steps; a band narrower than one step holds no candidate.
 BIN_RATIO = (FMAX / FMIN) ** (1 / 94)
 # The model's receptive field reaches 2815 samples each way: half of the 2048 window plus seven
 # frames. A frame's own hop covers 256 of those samples on the future side, so a streamed frame
 # is final once 10 later frames exist, and 11 earlier frames reproduce the batch result.
 LOOKAHEAD_FRAMES = 10
 LEFT_FRAMES = 11
+WINDOW_FRAMES = 1875
 
 # Digital silence sits on the spectrogram's log floor in every bin, a texture the model never saw,
 # and it answers with random voiced frames. Frames whose audio peaks below this get confidence 0.
@@ -35,25 +36,23 @@ class PitchResult:
     - pitch_hz: Estimated fundamental frequency in Hz for each frame
     - confidence: Voicing score (0-1) for each frame, calibrated so that a
       frame is voiced when its confidence is at least 0.5
-    - audio: The mono 16 kHz signal the frames were computed from
+    - loudness_db: Level in dB of the 32 ms of audio centered on each frame
     """
 
     timestamps: np.ndarray
     pitch_hz: np.ndarray
     confidence: np.ndarray
-    audio: np.ndarray
+    loudness_db: np.ndarray
 
     def __post_init__(self) -> None:
         self.timestamps = np.asarray(self.timestamps, dtype=np.float64)
         self.pitch_hz = np.asarray(self.pitch_hz, dtype=np.float64)
         self.confidence = np.asarray(self.confidence, dtype=np.float64)
-        self.audio = np.asarray(self.audio, dtype=np.float32)
-        if not (self.timestamps.ndim == self.pitch_hz.ndim == self.confidence.ndim == 1):
-            raise ValueError("timestamps, pitch_hz and confidence must be 1-D arrays")
-        if not (len(self.timestamps) == len(self.pitch_hz) == len(self.confidence)):
-            raise ValueError("timestamps, pitch_hz and confidence must have the same length")
-        if self.audio.ndim != 1:
-            raise ValueError("audio must be a 1-D array")
+        self.loudness_db = np.asarray(self.loudness_db, dtype=np.float64)
+        if not (self.timestamps.ndim == self.pitch_hz.ndim == self.confidence.ndim == self.loudness_db.ndim == 1):
+            raise ValueError("timestamps, pitch_hz, confidence and loudness_db must be 1-D arrays")
+        if not (len(self.timestamps) == len(self.pitch_hz) == len(self.confidence) == len(self.loudness_db)):
+            raise ValueError("timestamps, pitch_hz, confidence and loudness_db must have the same length")
 
 
 def concat(results: Iterable[PitchResult]) -> PitchResult:
@@ -72,7 +71,7 @@ def concat(results: Iterable[PitchResult]) -> PitchResult:
         timestamps=np.concatenate([r.timestamps for r in results]),
         pitch_hz=np.concatenate([r.pitch_hz for r in results]),
         confidence=np.concatenate([r.confidence for r in results]),
-        audio=np.concatenate([r.audio for r in results]),
+        loudness_db=np.concatenate([r.loudness_db for r in results]),
     )
 
 
@@ -88,6 +87,8 @@ def _check_number(name: str, value: object, *, allow_inf: bool = False, nonnegat
 def _mono(audio: npt.ArrayLike) -> np.ndarray:
     array = np.asarray(audio)
     dtype = array.dtype
+    if not (np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.floating)):
+        raise TypeError(f"audio must be a real integer or float array, got {dtype}")
     if array.ndim == 2:
         if array.shape[1] == 0:
             raise ValueError("audio has no channels")
@@ -95,11 +96,7 @@ def _mono(audio: npt.ArrayLike) -> np.ndarray:
             raise ValueError(f"audio must be channels last, got shape {array.shape}")
     elif array.ndim != 1:
         raise ValueError("audio must be a 1-D (mono) or 2-D (channels last) array")
-    if not np.isfinite(array).all():
-        raise ValueError("audio contains non-finite values")
     integer = np.issubdtype(dtype, np.integer)
-    if not integer and np.abs(array).max(initial=0) > np.finfo(np.float32).max:
-        raise ValueError("audio values exceed the float32 range")
     array = array.astype(np.float64 if integer else np.float32, copy=False)
     if array.ndim == 2:
         # Adding the channel columns is far faster than a numpy reduction along a length-2 axis.
@@ -112,7 +109,10 @@ def _mono(audio: npt.ArrayLike) -> np.ndarray:
         offset = 0.0 if np.issubdtype(dtype, np.signedinteger) else full_scale
         array = (array - offset) / full_scale
     # A copy, so the result never aliases the caller's array.
-    return np.array(array, dtype=np.float32)
+    signal = np.array(array, dtype=np.float32)
+    if not np.isfinite(signal).all():
+        raise ValueError("audio must be finite and within the float32 range")
+    return signal
 
 
 def _check_rate(sample_rate: float) -> int:
@@ -158,7 +158,7 @@ class SwiftF0:
     `threads` sets the size of the ONNX Runtime thread pool; the default is
     the number of physical cores, and more than about six threads do not help
     this model. `spin=False` lets the pool sleep between calls instead of
-    busy-waiting, which costs about a millisecond per call and frees the CPU
+    busy-waiting, which costs about 1 ms per call and frees the CPU
     between calls: the right setting for streaming and for shared servers.
     """
 
@@ -168,7 +168,6 @@ class SwiftF0:
         options = onnxruntime.SessionOptions()
         if threads is not None:
             options.intra_op_num_threads = threads
-            options.inter_op_num_threads = threads
         if not spin:
             options.add_session_config_entry("session.intra_op.allow_spinning", "0")
         self.session = onnxruntime.InferenceSession(
@@ -177,7 +176,7 @@ class SwiftF0:
             providers=["CPUExecutionProvider"],
         )
 
-    def _run(self, audio: np.ndarray, fmin: float, fmax: float) -> Tuple[np.ndarray, np.ndarray]:
+    def _run(self, audio: np.ndarray, fmin: float, fmax: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         pitch, confidence = self.session.run(
             ["pitch", "confidence"],
             {"audio": audio[None, :], "fmin": np.asarray(fmin, dtype=np.float32), "fmax": np.asarray(fmax, dtype=np.float32)},
@@ -186,7 +185,11 @@ class SwiftF0:
         n = len(confidence)
         hops = audio[: n * HOP].reshape(n, HOP) if len(audio) >= HOP else audio[None, :]
         confidence[np.abs(hops).max(axis=1) < SILENCE_PEAK] = 0.0
-        return pitch, confidence
+        power = np.zeros(n)
+        for column in hops.T:
+            power += np.square(column, dtype=np.float64)
+        loudness = 20 * np.log10(np.maximum(np.sqrt((np.concatenate(([0.0], power[:-1])) + power) / 512), 1e-7))
+        return pitch, confidence, loudness
 
     def detect(self, audio: npt.ArrayLike, sample_rate: float, fmin: Optional[float] = None, fmax: Optional[float] = None) -> PitchResult:
         sample_rate = _check_rate(sample_rate)
@@ -198,8 +201,15 @@ class SwiftF0:
             signal = _soxr().resample(signal, sample_rate, SAMPLE_RATE)
             if signal.size == 0:
                 raise ValueError("audio is too short to resample to 16 kHz")
-        pitch, confidence = self._run(signal, fmin, fmax)
-        return PitchResult(_timestamps(0, len(pitch)), pitch, confidence, signal)
+        n = max(1, len(signal) // HOP)
+        parts = []
+        for start in range(0, n, WINDOW_FRAMES):
+            end = min(start + WINDOW_FRAMES, n)
+            left = max(0, start - LEFT_FRAMES)
+            window = signal[left * HOP : (end + LOOKAHEAD_FRAMES) * HOP] if end < n else signal[left * HOP :]
+            parts.append([values[start - left : end - left] for values in self._run(window, fmin, fmax)])
+        pitch, confidence, loudness = (np.concatenate([part[i] for part in parts]) for i in range(3))
+        return PitchResult(_timestamps(0, len(pitch)), pitch, confidence, loudness)
 
     def detect_file(self, path: PathLike, fmin: Optional[float] = None, fmax: Optional[float] = None) -> PitchResult:
         try:
@@ -260,13 +270,12 @@ class PitchStream:
             available = 1
         last = available if final else available - LOOKAHEAD_FRAMES
         if last > first:
-            pitch, confidence = self._detector._run(self._buffer, self._fmin, self._fmax)
-            pitch, confidence = pitch[first:last].copy(), confidence[first:last].copy()
+            pitch, confidence, loudness = self._detector._run(self._buffer, self._fmin, self._fmax)
+            pitch, confidence, loudness = pitch[first:last].copy(), confidence[first:last].copy(), loudness[first:last].copy()
         else:
             last = first
-            pitch, confidence = np.zeros(0), np.zeros(0)
-        audio = (self._buffer[first * HOP :] if final else self._buffer[first * HOP : last * HOP]).copy()
-        result = PitchResult(_timestamps(self._emitted, len(pitch)), pitch, confidence, audio)
+            pitch, confidence, loudness = np.zeros(0), np.zeros(0), np.zeros(0)
+        result = PitchResult(_timestamps(self._emitted, len(pitch)), pitch, confidence, loudness)
         self._emitted += len(pitch)
         if final:
             self._buffer = np.zeros(0, dtype=np.float32)
@@ -279,7 +288,8 @@ class PitchStream:
 
 def export_to_csv(result: PitchResult, output_path: PathLike, *, threshold: float = 0.5) -> None:
     """
-    Export pitch detection results to CSV file.
+    Export pitch detection results to CSV file. The columns are timestamp
+    in seconds, pitch_hz in Hz, confidence and voiced.
 
     Args:
         result: PitchResult object containing detection results

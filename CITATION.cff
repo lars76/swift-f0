@@ -5,8 +5,8 @@ type: software
 authors:
   - family-names: Nieradzik
     given-names: Lars
-version: 0.2.0
-date-released: 2026-09-19
+version: 0.3.0
+date-released: 2026-09-25
 repository-code: https://github.com/lars76/swift-f0
 url: https://swift-f0.github.io/
 license: MIT

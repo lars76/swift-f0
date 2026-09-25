@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "swift-f0"
-version = "0.2.0"
+version = "0.3.0"
 description = "Fast and accurate fundamental frequency (F0) detector using convolutional neural networks"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -48,14 +48,14 @@ classifiers = [
 ]
 
 dependencies = [
-    "onnxruntime>=1.18",
+    "onnxruntime>=1.19",
     "numpy>=1.21.6",
 ]
 
 [project.optional-dependencies]
-full = ["soundfile", "soxr", "matplotlib", "mido"]
+full = ["soundfile", "soxr", "matplotlib>=3.3", "mido"]
 audio = ["soundfile", "soxr"]
-viz = ["matplotlib"]
+viz = ["matplotlib>=3.3"]
 midi = ["mido"]
 
 [project.urls]
@@ -65,6 +65,7 @@ Changelog = "https://github.com/lars76/swift-f0/blob/main/CHANGELOG.md"
 "Bug Reports" = "https://github.com/lars76/swift-f0/issues"
 Demo = "https://swift-f0.github.io/"
 Paper = "https://arxiv.org/abs/2508.18440"
+Training = "https://github.com/lars76/swift-f0-training"
 
 [dependency-groups]
 dev = ["soundfile", "soxr", "matplotlib", "mido", "mypy", "ruff"]
